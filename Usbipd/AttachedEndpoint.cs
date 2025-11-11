@@ -60,6 +60,20 @@ sealed class AttachedEndpoint
 
     readonly Channel<Task<RequestReply>> EndpointChannel = Channel.CreateUnbounded<Task<RequestReply>>(new() { SingleWriter = true, SingleReader = true });
 
+    // Workaround rationale: VBoxUSB/Windows may reject a NULL buffer for zero-length OUT URBs.
+    // We keep URB length at 0 (true ZLP on the wire) but provide a non-NULL pinned buffer.
+    // We care about non-ISO bulk/interrupt OUT with a 0-length payload (true ZLP).
+    internal static bool NeedsZeroLengthOutWorkaround(
+        UsbSupTransferType type,
+        UsbIpHeaderBasic basic,
+        UsbIpHeaderCmdSubmit submit)
+    {
+        return basic.direction == UsbIpDir.USBIP_DIR_OUT
+               && submit.transfer_buffer_length == 0
+               && (type == UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK
+                   || type == UsbSupTransferType.USBSUP_TRANSFER_TYPE_INTR);
+    }
+
     async Task HandleSubmitIsochronousAsync(UsbIpHeaderBasic basic, UsbIpHeaderCmdSubmit submit, CancellationToken cancellationToken)
     {
         var buf = new byte[submit.transfer_buffer_length];
@@ -241,16 +255,28 @@ sealed class AttachedEndpoint
         }
 
         var bytes = new byte[Unsafe.SizeOf<UsbSupUrb>()];
-        var buf = new byte[urb.len];
+        // Work around Windows/VBox not liking a NULL buffer for 0-length OUT URBs
+        // by always providing at least one byte of backing storage, even though
+        // urb.len (and the actual transfer length on the bus) stays zero.
+        var needsZlpWorkaround = NeedsZeroLengthOutWorkaround(urb.type, basic, submit);
+        var bufLength = (int)urb.len;
+        if (needsZlpWorkaround && bufLength == 0)
+        {
+            bufLength = payloadOffset + 1; // keep payloadOffset if there is a setup
+        }
+        var buf = new byte[bufLength];
 
         if (urb.type == UsbSupTransferType.USBSUP_TRANSFER_TYPE_MSG)
         {
             StructToBytes(submit.setup, buf);
         }
 
-        if (basic.direction == UsbIpDir.USBIP_DIR_OUT)
+    if (basic.direction == UsbIpDir.USBIP_DIR_OUT && requestLength > 0)
         {
-            await Stream.ReadMessageAsync(buf.AsMemory()[payloadOffset..], cancellationToken);
+            // Only read the actual payload bytes, not any extra dummy byte for the workaround.
+            await Stream.ReadMessageAsync(
+        buf.AsMemory(payloadOffset, (int)requestLength),
+                cancellationToken);
         }
 
         // We now have received the entire SUBMIT request:
@@ -260,7 +286,12 @@ sealed class AttachedEndpoint
         //   This means multiple URBs can be outstanding awaiting completion.
         //   The pending URBs can be completed out of order, but for each endpoint the replies must be sent in order.
 
-        Pcap.DumpPacketNonIsoRequest(basic, submit, basic.direction == UsbIpDir.USBIP_DIR_OUT ? buf.AsSpan(payloadOffset) : ReadOnlySpan<byte>.Empty);
+        Pcap.DumpPacketNonIsoRequest(
+            basic,
+            submit,
+            (basic.direction == UsbIpDir.USBIP_DIR_OUT && requestLength > 0)
+                ? buf.AsSpan(payloadOffset, (int)requestLength)
+                : ReadOnlySpan<byte>.Empty);
 
         Task ioctl;
 
