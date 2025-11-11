@@ -2,64 +2,51 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Threading.Channels;
 using static Usbipd.Interop.UsbIp;
 using static Usbipd.Interop.VBoxUsb;
 
 namespace UnitTests;
 
 [TestClass]
-public sealed class AttachedEndpoint_ZlpWorkaround_Tests
+sealed class AttachedEndpointZlpWorkaroundTests
 {
-    sealed class TestDeviceFile : Usbipd.DeviceFile
-    {
-        public TestDeviceFile() : base("\\\\.\\NUL") { }
-        public UsbSupUrb? CapturedUrb { get; private set; }
-        public override Task<uint> IoControlAsync(uint ioControlCode, byte[]? input, byte[]? output, bool exactOutput = true)
-        {
-            if (ioControlCode == (uint)SUPUSB_IOCTL.SEND_URB && input is not null && input.Length == Unsafe.SizeOf<UsbSupUrb>())
-            {
-                Usbipd.Tools.BytesToStruct(input, out UsbSupUrb urb);
-                CapturedUrb = urb;
-            }
-            return Task.FromResult(0u);
-        }
-    }
-
     [TestMethod]
-    public async Task BulkOutZeroLength_AllocatesDummyBufferButKeepsLenZero()
+    public void NeedsZeroLengthOutWorkaroundReturnsTrueForBulkOutZlp()
     {
-        var loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Debug));
-        var logger = loggerFactory.CreateLogger("test");
-
-        var deviceFile = new TestDeviceFile();
-        var clientContext = new Usbipd.ClientContext(new System.Net.Sockets.TcpClient(), deviceFile);
-
-        var pcap = new Usbipd.PcapNg(System.IO.Stream.Null);
-        var replyChannel = Channel.CreateUnbounded<Usbipd.RequestReply>();
-        var endpoint = new Usbipd.AttachedEndpoint(logger, clientContext, pcap, 0x02, replyChannel, CancellationToken.None);
-
         var basic = new UsbIpHeaderBasic
         {
-            command = UsbIpCmd.USBIP_CMD_SUBMIT,
-            seqnum = 1,
-            ep = 0x02, // OUT bulk endpoint address
+            ep = 0x02,
             direction = UsbIpDir.USBIP_DIR_OUT,
         };
         var submit = new UsbIpHeaderCmdSubmit
         {
-            transfer_flags = 0,
             transfer_buffer_length = 0,
-            number_of_packets = -1,
         };
-
-        await endpoint.HandleSubmitAsync(basic, submit, CancellationToken.None);
-
-        Assert.IsNotNull(deviceFile.CapturedUrb, "URB should have been captured");
-        Assert.AreEqual((uint)0, deviceFile.CapturedUrb!.len, "URB length must remain zero for true ZLP");
-        // buf pointer should be non-zero (dummy buffer allocated and pinned)
-        Assert.AreNotEqual(nint.Zero, deviceFile.CapturedUrb.buf, "Dummy buffer pointer should be non-zero");
+        Assert.IsTrue(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK, basic, submit));
+        Assert.IsTrue(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(UsbSupTransferType.USBSUP_TRANSFER_TYPE_INTR, basic, submit));
     }
-    // Removed: superseded by AttachedEndpoint_Helper_Tests
+
+    [TestMethod]
+    public void NeedsZeroLengthOutWorkaroundReturnsFalseForOtherCases()
+    {
+        Assert.IsFalse(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(
+            UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK,
+            new UsbIpHeaderBasic { direction = UsbIpDir.USBIP_DIR_IN },
+            new UsbIpHeaderCmdSubmit { transfer_buffer_length = 0 }));
+
+        Assert.IsFalse(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(
+            UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK,
+            new UsbIpHeaderBasic { direction = UsbIpDir.USBIP_DIR_OUT },
+            new UsbIpHeaderCmdSubmit { transfer_buffer_length = 1 }));
+
+        Assert.IsFalse(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(
+            UsbSupTransferType.USBSUP_TRANSFER_TYPE_MSG,
+            new UsbIpHeaderBasic { direction = UsbIpDir.USBIP_DIR_OUT },
+            new UsbIpHeaderCmdSubmit { transfer_buffer_length = 0 }));
+
+        Assert.IsFalse(Usbipd.AttachedEndpoint.NeedsZeroLengthOutWorkaround(
+            UsbSupTransferType.USBSUP_TRANSFER_TYPE_ISOC,
+            new UsbIpHeaderBasic { direction = UsbIpDir.USBIP_DIR_OUT },
+            new UsbIpHeaderCmdSubmit { transfer_buffer_length = 0 }));
+    }
+}

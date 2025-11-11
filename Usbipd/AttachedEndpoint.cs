@@ -222,6 +222,11 @@ sealed class AttachedEndpoint
 
     public async Task HandleSubmitAsync(UsbIpHeaderBasic basic, UsbIpHeaderCmdSubmit submit, CancellationToken cancellationToken)
     {
+    // Note: This method includes a workaround for zero-length bulk/interrupt OUT transfers (true ZLPs):
+    // - We keep urb.len equal to submit.transfer_buffer_length (0 for ZLP) so the bus-level transfer is a real ZLP.
+    // - For Windows/VBoxUSB stability, we still pass a non-NULL pinned buffer pointer by allocating a 1-byte dummy array.
+    // - We never read payload for ZLP; PCAP and reply headers reflect zero-length as before.
+
         _ = Interlocked.Increment(ref InterlockedSubmits);
 
         if (basic.EndpointType(submit) == UsbSupTransferType.USBSUP_TRANSFER_TYPE_ISOC)
@@ -262,6 +267,8 @@ sealed class AttachedEndpoint
         var bufLength = (int)urb.len;
         if (needsZlpWorkaround && bufLength == 0)
         {
+            // Allocate one extra byte solely to keep a valid (non-NULL) buffer pointer for the driver.
+            // If this is a control transfer (MSG), payloadOffset points past the setup packet.
             bufLength = payloadOffset + 1; // keep payloadOffset if there is a setup
         }
         var buf = new byte[bufLength];
@@ -286,7 +293,8 @@ sealed class AttachedEndpoint
         //   This means multiple URBs can be outstanding awaiting completion.
         //   The pending URBs can be completed out of order, but for each endpoint the replies must be sent in order.
 
-        Pcap.DumpPacketNonIsoRequest(
+    // For PCAP we still treat true ZLPs as zero-length payloads.
+    Pcap.DumpPacketNonIsoRequest(
             basic,
             submit,
             (basic.direction == UsbIpDir.USBIP_DIR_OUT && requestLength > 0)
@@ -362,6 +370,8 @@ sealed class AttachedEndpoint
             }
             else
             {
+                // No buffer at all (e.g., control transfers or IN cases where a dummy buffer is not needed).
+                // For true ZLP OUT on bulk/interrupt, the workaround above ensures buf.Length > 0 so we come through the pinned path.
                 urb.buf = 0;
                 StructToBytes(urb, bytes);
                 ioctl = Device.IoControlAsync(SUPUSB_IOCTL.SEND_URB, bytes, bytes);
